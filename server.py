@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 ROOT = Path(__file__).resolve().parent
 IS_VERCEL = bool(os.environ.get("VERCEL"))
@@ -69,7 +69,7 @@ MAX_PROGRESS_BYTES = env_int("MAX_PROGRESS_BYTES", 2_000_000, minimum=100000, ma
 if not SESSION_SECRET and not IS_VERCEL:
     SESSION_SECRET = "code-station-local-dev-secret-change-me"
 
-app = FastAPI(title="PédagoLab × CODE//STATION API", version="6.2-fixed")
+app = FastAPI(title="PédagoLab × CODE//STATION API", version="6.3-vercel-root-fix")
 _schema_lock = threading.Lock()
 _schema_ready = False
 
@@ -345,6 +345,38 @@ async def no_store_api(request: Request, call_next):
 
 
 # ----------------------------- API routes ---------------------------------
+@app.get("/", include_in_schema=False)
+def frontend_root():
+    """Sert le jeu à la racine du domaine Vercel."""
+    game_file = ROOT / "JOUER.html"
+    if not game_file.exists():
+        game_file = ROOT / "index.html"
+    if not game_file.exists():
+        return JSONResponse(
+            {"detail": "Frontend introuvable: JOUER.html/index.html absent du déploiement."},
+            status_code=500,
+        )
+    return FileResponse(game_file, media_type="text/html")
+
+
+@app.get("/JOUER.html", include_in_schema=False)
+def frontend_jouer():
+    game_file = ROOT / "JOUER.html"
+    if not game_file.exists():
+        return JSONResponse({"detail": "JOUER.html introuvable."}, status_code=404)
+    return FileResponse(game_file, media_type="text/html")
+
+
+@app.get("/index.html", include_in_schema=False)
+def frontend_index():
+    game_file = ROOT / "index.html"
+    if not game_file.exists():
+        game_file = ROOT / "JOUER.html"
+    if not game_file.exists():
+        return JSONResponse({"detail": "Frontend introuvable."}, status_code=404)
+    return FileResponse(game_file, media_type="text/html")
+
+
 @app.get("/api/status")
 def api_status():
     # Ne pas tenter une fausse persistance SQLite sur Vercel.
@@ -553,7 +585,7 @@ def api_reset_progress(student_id: str, request: Request):
 
 @app.get("/api")
 def api_root():
-    return ok({"service": "PédagoLab × CODE//STATION", "version": "6.2-fixed"})
+    return ok({"service": "PédagoLab × CODE//STATION", "version": "6.3-vercel-root-fix"})
 
 
 if __name__ == "__main__":
@@ -564,5 +596,4 @@ if __name__ == "__main__":
     port = env_int("PORT", 8765, minimum=1, maximum=65535)
     print(f"CODE//STATION PédagoLab API : http://{host}:{port}/api/status")
     print("Frontend : ouvre index.html via `vercel dev` pour tester le même origin.")
-    
     uvicorn.run("server:app", host=host, port=port, reload=False)
