@@ -564,4 +564,5 @@ if __name__ == "__main__":
     port = env_int("PORT", 8765, minimum=1, maximum=65535)
     print(f"CODE//STATION PédagoLab API : http://{host}:{port}/api/status")
     print("Frontend : ouvre index.html via `vercel dev` pour tester le même origin.")
+    
     uvicorn.run("server:app", host=host, port=port, reload=False)
