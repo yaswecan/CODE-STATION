@@ -22,29 +22,54 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 
 ROOT = Path(__file__).resolve().parent
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 IS_VERCEL = bool(os.environ.get("VERCEL"))
+
+# Vercel Functions ne doivent pas dépendre d'un stockage persistant local.
+# Le fallback SQLite sert uniquement au développement local. Sur Vercel,
+# PostgreSQL/Neon via DATABASE_URL est obligatoire.
+if IS_VERCEL:
+    LOCAL_DB = Path("/tmp/pedagolab.sqlite3")
+else:
+    DATA = ROOT / "data"
+    DATA.mkdir(parents=True, exist_ok=True)
+    LOCAL_DB = DATA / "pedagolab.sqlite3"
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip()
 
-# Vercel Functions: n'écris pas dans le bundle déployé. /tmp est l'espace
-# temporaire prévu pour d'éventuels fichiers runtime. En production Neon est
-# obligatoire, donc SQLite n'est utilisé qu'en développement local.
-DATA = Path("/tmp/code-station") if IS_VERCEL else (ROOT / "data")
-DATA.mkdir(parents=True, exist_ok=True)
-LOCAL_DB = DATA / "pedagolab.sqlite3"
-SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "43200"))  # 12 h
-ITERATIONS = int(os.environ.get("PIN_PBKDF2_ITERATIONS", "260000"))
-MAX_PROGRESS_BYTES = int(os.environ.get("MAX_PROGRESS_BYTES", "2000000"))
+def env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    """Lit un entier d'environnement sans jamais faire planter l'import.
 
-if not SESSION_SECRET:
-    # Correct pour le développement local uniquement. En production, /api/status
-    # indiquera clairement que SESSION_SECRET doit être fourni.
+    Vercel peut contenir une variable vide ou mal remplie (par exemple
+    MAX_PROGRESS_BYTES=MAX_PROGRESS_BYTES). Dans ce cas on reprend le défaut.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        value = default
+    else:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+SESSION_TTL_SECONDS = env_int("SESSION_TTL_SECONDS", 43200, minimum=300, maximum=604800)
+ITERATIONS = env_int("PIN_PBKDF2_ITERATIONS", 260000, minimum=100000, maximum=2000000)
+MAX_PROGRESS_BYTES = env_int("MAX_PROGRESS_BYTES", 2_000_000, minimum=100000, maximum=20_000_000)
+
+# Secret de développement uniquement. En production Vercel, SESSION_SECRET
+# doit être explicitement défini et les routes API renverront 503 sinon.
+if not SESSION_SECRET and not IS_VERCEL:
     SESSION_SECRET = "code-station-local-dev-secret-change-me"
 
-app = FastAPI(title="PédagoLab × CODE//STATION API", version="6.2")
+app = FastAPI(title="PédagoLab × CODE//STATION API", version="6.2-fixed")
 _schema_lock = threading.Lock()
 _schema_ready = False
 
@@ -98,6 +123,8 @@ def _unb64(data: str) -> bytes:
 
 
 def issue_token(role: str, user_id: str) -> str:
+    if not SESSION_SECRET:
+        raise RuntimeError("SESSION_SECRET manquant.")
     payload = {
         "role": role,
         "userId": user_id,
@@ -111,6 +138,8 @@ def issue_token(role: str, user_id: str) -> str:
 
 
 def verify_token(token: str, role: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not SESSION_SECRET:
+        return None
     try:
         body, sig = token.split(".", 1)
         expected = _b64(hmac.new(SESSION_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
@@ -298,23 +327,21 @@ def ok(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
 
 
 @app.middleware("http")
+async def runtime_config_guard(request: Request, call_next):
+    if request.url.path.startswith("/api/") or request.url.path == "/api":
+        if IS_VERCEL and not DATABASE_URL:
+            return error("DATABASE_URL manquant. Connecte Neon/PostgreSQL au projet Vercel.", 503)
+        if IS_VERCEL and not SESSION_SECRET:
+            return error("SESSION_SECRET manquant dans les variables d'environnement Vercel.", 503)
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def no_store_api(request: Request, call_next):
     response = await call_next(request)
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
-
-
-# ----------------------------- Frontend -----------------------------------
-@app.get("/", include_in_schema=False)
-def frontend_root():
-    # JOUER.html est autonome : pas de dépendances statiques externes.
-    return FileResponse(ROOT / "JOUER.html", media_type="text/html")
-
-
-@app.get("/JOUER.html", include_in_schema=False)
-def frontend_standalone():
-    return FileResponse(ROOT / "JOUER.html", media_type="text/html")
 
 
 # ----------------------------- API routes ---------------------------------
@@ -323,7 +350,7 @@ def api_status():
     # Ne pas tenter une fausse persistance SQLite sur Vercel.
     if IS_VERCEL and not DATABASE_URL:
         return error("DATABASE_URL manquant. Connecte Neon/PostgreSQL au projet Vercel.", 503)
-    if IS_VERCEL and SESSION_SECRET == "code-station-local-dev-secret-change-me":
+    if IS_VERCEL and not SESSION_SECRET:
         return error("SESSION_SECRET manquant dans les variables d'environnement Vercel.", 503)
     try:
         init_schema()
@@ -332,7 +359,7 @@ def api_status():
             count = one(conn, "SELECT COUNT(*) AS n FROM students")
         return ok({
             "codeStationServer": True,
-            "version": "6.2-vercel",
+            "version": "6.2-fixed",
             "storage": db_kind(),
             "teacherConfigured": bool(teacher),
             "students": int(count["n"] if count else 0),
@@ -526,7 +553,7 @@ def api_reset_progress(student_id: str, request: Request):
 
 @app.get("/api")
 def api_root():
-    return ok({"service": "PédagoLab × CODE//STATION", "version": "6.2-vercel"})
+    return ok({"service": "PédagoLab × CODE//STATION", "version": "6.2-fixed"})
 
 
 if __name__ == "__main__":
@@ -534,7 +561,7 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8765"))
+    port = env_int("PORT", 8765, minimum=1, maximum=65535)
     print(f"CODE//STATION PédagoLab API : http://{host}:{port}/api/status")
     print("Frontend : ouvre index.html via `vercel dev` pour tester le même origin.")
     uvicorn.run("server:app", host=host, port=port, reload=False)
